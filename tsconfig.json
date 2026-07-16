@@ -3,7 +3,6 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -11,18 +10,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "outDir": "./dist/client",
-    "rootDir": "./src",
-    "baseUrl": ".",
-    "paths": {
-      "@shared/*": ["./src/shared/*"],
-      "@client/*": ["./src/client/*"],
-      "@server/*": ["./src/server/*"]
-    }
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "src/server/**"]
+  "include": ["src/**/*.ts"]
 }

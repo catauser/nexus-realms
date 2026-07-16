@@ -1,507 +1,922 @@
-// ============================================================
-// Nexus Realms — Game Scene
-// Main gameplay scene: tilemap, entities, input, camera,
-// HUD, combat, particles, sound, and network integration
-// ============================================================
-
+// GameScene — The actual playable game
 import Phaser from 'phaser';
-import { WebSocketClient } from '../network/WebSocketClient';
-import { NetworkHandler } from '../network/NetworkHandler';
-import { InputManager, InputAction } from '../systems/InputManager';
-import { CameraManager } from '../systems/CameraManager';
-import { EntityManager } from '../systems/EntityManager';
-import { CombatRenderer } from '../systems/CombatRenderer';
-import { TilemapRenderer } from '../systems/TilemapRenderer';
-import { ParticleSystem } from '../systems/ParticleSystem';
-import { SoundManager } from '../systems/SoundManager';
-import { HUD } from '../ui/HUD';
-import { InventoryUI } from '../ui/InventoryUI';
-import { ChatUI } from '../ui/ChatUI';
-import { QuestTracker } from '../ui/QuestTracker';
-import { MapUI } from '../ui/MapUI';
-import {
-  PlayerData, GAME_CONFIG, Direction, ChatChannel, MonsterData, NPCData, WeatherType,
-} from '../../shared/types';
+
+// ─── Constants ───────────────────────────────────────────────
+const TILE = 32;
+const MAP_W = 80;  // tiles
+const MAP_H = 60;  // tiles
+const SPEED = 160;
+
+// ─── Map Data (0=grass, 1=dirt, 2=stone, 3=water, 4=wall, 5=tree, 6=flowers, 7=bush, 8=rock)
+const MAP: number[][] = [];
+for (let y = 0; y < MAP_H; y++) {
+  MAP[y] = [];
+  for (let x = 0; x < MAP_W; x++) {
+    // Border walls
+    if (x === 0 || y === 0 || x === MAP_W - 1 || y === MAP_H - 1) {
+      MAP[y][x] = 4;
+    }
+    // Water pond
+    else if (x >= 60 && x <= 68 && y >= 20 && y <= 26) {
+      MAP[y][x] = 3;
+    }
+    // Village area (stone floor)
+    else if (x >= 30 && x <= 50 && y >= 25 && y <= 40) {
+      MAP[y][x] = 2;
+    }
+    // Dirt paths
+    else if ((y === 32 && x >= 10 && x <= 50) || (x === 40 && y >= 10 && y <= 50)) {
+      MAP[y][x] = 1;
+    }
+    // Scattered trees
+    else if (Math.random() < 0.08 && x > 5 && y > 5) {
+      MAP[y][x] = 5;
+    }
+    // Scattered rocks
+    else if (Math.random() < 0.03) {
+      MAP[y][x] = 8;
+    }
+    // Flowers
+    else if (Math.random() < 0.05) {
+      MAP[y][x] = 6;
+    }
+    // Bushes
+    else if (Math.random() < 0.04) {
+      MAP[y][x] = 7;
+    }
+    // Default grass
+    else {
+      MAP[y][x] = 0;
+    }
+  }
+}
+
+// ─── Tile lookup
+const TILE_KEYS = [
+  'tile_grass', 'tile_dirt', 'tile_stone', 'tile_water',
+  'tile_wall', 'tile_tree_trunk', 'tile_flowers', 'tile_bush', 'tile_rock',
+];
+
+// ─── Entity Types ────────────────────────────────────────────
+interface MonsterData {
+  sprite: Phaser.Physics.Arcade.Sprite;
+  hp: number;
+  maxHp: number;
+  name: string;
+  level: number;
+  damage: number;
+  xp: number;
+  speed: number;
+  direction: number;
+  moveTimer: number;
+  hpBar: Phaser.GameObjects.Graphics;
+  dead: boolean;
+  aggroRange: number;
+  target: boolean;
+}
+
+interface NPCData {
+  sprite: Phaser.Physics.Arcade.Sprite;
+  name: string;
+  dialogue: string[];
+  type: 'merchant' | 'quest' | 'guard';
+}
+
+interface LootData {
+  sprite: Phaser.Physics.Arcade.Sprite;
+  itemId: string;
+  name: string;
+}
 
 export class GameScene extends Phaser.Scene {
-  // Core systems
-  private ws!: WebSocketClient;
-  private network!: NetworkHandler;
-  private inputManager!: InputManager;
-  private cameraManager!: CameraManager;
-  private entityManager!: EntityManager;
-  private combatRenderer!: CombatRenderer;
-  private tilemapRenderer!: TilemapRenderer;
-  private particles!: ParticleSystem;
-  private soundManager!: SoundManager;
+  // Player
+  private player!: Phaser.Physics.Arcade.Sprite;
+  private playerHp = 100;
+  private playerMaxHp = 100;
+  private playerMp = 50;
+  private playerMaxMp = 50;
+  private playerLevel = 1;
+  private playerXp = 0;
+  private playerXpToLevel = 100;
+  private playerDamage = 15;
+  private playerDirection = 'down';
+  private playerName = 'Hero';
+  private isAttacking = false;
+  private attackCooldown = 0;
+  private isDead = false;
+  private respawnTimer = 0;
 
-  // UI
-  private hud!: HUD;
-  private inventoryUI!: InventoryUI;
-  private chatUI!: ChatUI;
-  private questTracker!: QuestTracker;
-  private mapUI!: MapUI;
+  // Gold
+  private gold = 0;
 
-  // Player state
-  private localPlayer: PlayerData | null = null;
-  private playerSpeed: number = 160;
-  private worldReady: boolean = false;
+  // Inventory
+  private inventory: { id: string; name: string; qty: number; icon: string }[] = [];
 
-  // Movement
-  private moveSequence: number = 0;
-  private lastMoveSendTime: number = 0;
-  private moveSendInterval: number = 50; // 20Hz
+  // Combat
+  private targetMonster: MonsterData | null = null;
+  private lastDamageTime = 0;
+  private combatRegenTimer = 0;
 
-  // Ability cooldowns (slot → endsAt)
-  private abilityCooldowns: Map<number, number> = new Map();
+  // World
+  private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
+  private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
+  private monsters: MonsterData[] = [];
+  private npcs: NPCData[] = [];
+  private loots: LootData[] = [];
 
-  // Chat message tracking
-  private lastChatCount: number = 0;
+  // Camera
+  private worldBounds = { x: 0, y: 0, w: MAP_W * TILE, h: MAP_H * TILE };
 
-  // Weather
-  private currentWeather: WeatherType = WeatherType.CLEAR;
+  // UI scene reference
+  private uiScene!: Phaser.Scene;
 
   constructor() {
     super({ key: 'GameScene' });
   }
 
-  init(data: { ws: WebSocketClient; authData: Record<string, unknown> }): void {
-    this.ws = data.ws;
-    this.worldReady = false;
-    this.lastChatCount = 0;
-    this.localPlayer = null;
-    this.abilityCooldowns.clear();
-  }
-
   create(): void {
-    this.cameras.main.setBackgroundColor('#0a0a1a');
-    this.cameras.main.fadeIn(500, 0, 0, 0);
+    // ─── Create Tilemap ─────────────────────────────────────
+    for (let y = 0; y < MAP_H; y++) {
+      for (let x = 0; x < MAP_W; x++) {
+        const tileType = MAP[y][x];
+        const key = TILE_KEYS[tileType] || 'tile_grass';
+        const img = this.add.image(x * TILE + TILE / 2, y * TILE + TILE / 2, key);
+        img.setDepth(0);
 
-    // ── Sound Manager ───────────────────────────────────────
-    this.soundManager = new SoundManager();
-    // Store reference on game for LoginScene to init on user interaction
-    (this.game as Phaser.Game & { __soundManager?: SoundManager }).__soundManager = this.soundManager;
-    this.soundManager.init();
-    this.soundManager.startMusic();
-
-    // ── Network Handler ─────────────────────────────────────
-    this.network = new NetworkHandler(this.ws);
-
-    // ── Particle System ─────────────────────────────────────
-    this.particles = new ParticleSystem(this);
-
-    // ── Tilemap Renderer ────────────────────────────────────
-    this.tilemapRenderer = new TilemapRenderer(this);
-    this.tilemapRenderer.setWorldSize(256, 256);
-
-    // ── Entity Manager ──────────────────────────────────────
-    this.entityManager = new EntityManager(this, this.network);
-
-    // ── Combat Renderer ─────────────────────────────────────
-    this.combatRenderer = new CombatRenderer(this, this.entityManager, this.particles, this.soundManager);
-
-    // ── Input Manager ───────────────────────────────────────
-    this.inputManager = new InputManager(this);
-    this.inputManager.setInputCallback(this.handleInput.bind(this));
-
-    // ── Camera Manager ──────────────────────────────────────
-    this.cameraManager = new CameraManager(this.cameras.main, {
-      followSmoothTime: 0.12,
-      minZoom: 0.5,
-      maxZoom: 2.0,
-      zoomStep: 0.1,
-    });
-
-    // ── HUD ─────────────────────────────────────────────────
-    this.hud = new HUD(this);
-
-    // ── Inventory ───────────────────────────────────────────
-    this.inventoryUI = new InventoryUI(this);
-    this.inventoryUI.setCallbacks({
-      onMoveItem: (from, to) => this.ws.send('inventory.move', { from_slot: from, to_slot: to }),
-      onUseItem: (slot) => this.ws.send('inventory.use_item', { slot }),
-      onEquipItem: (itemSlot, equipSlot) => this.ws.send('equipment.equip', { item_slot: itemSlot, equip_slot: equipSlot }),
-      onUnequipItem: (equipSlot) => this.ws.send('equipment.unequip', { equip_slot: equipSlot }),
-    });
-
-    // ── Chat ────────────────────────────────────────────────
-    this.chatUI = new ChatUI(this);
-    this.chatUI.setOnSendMessage((channel, message, target) => {
-      this.ws.send('chat.send', { channel, message, target: target ?? '' });
-    });
-
-    // ── Quest Tracker ───────────────────────────────────────
-    this.questTracker = new QuestTracker(this);
-
-    // ── Map UI ──────────────────────────────────────────────
-    this.mapUI = new MapUI(this);
-    this.mapUI.setWorldSize(256, 256);
-
-    // ── Check for auth data (arrives via ws.on) ─────────────
-    const store = this.network.getStore();
-
-    // Auth success handler
-    this.ws.on('auth.success', () => {
-      this.localPlayer = store.localPlayer;
-      if (this.localPlayer && !this.worldReady) {
-        this.setupWorld();
-      }
-    });
-
-    // Zone transition handler
-    this.ws.on('zone.transition', () => {
-      this.worldReady = false;
-      this.time.delayedCall(200, () => {
-        this.localPlayer = store.localPlayer;
-        if (this.localPlayer) {
-          this.setupWorld();
+        // Make trees/walls/rocks/water solid
+        if (tileType === 4 || tileType === 5 || tileType === 8 || tileType === 3) {
+          const body = this.physics.add.staticImage(x * TILE + TILE / 2, y * TILE + TILE / 2, key);
+          body.setSize(TILE, TILE);
+          body.setImmovable(true);
+          body.setVisible(false);
+          (body as any).tileType = tileType;
         }
-      });
+      }
+    }
+
+    // ─── Create Player ──────────────────────────────────────
+    this.player = this.physics.add.sprite(40 * TILE, 32 * TILE, 'player_down_0');
+    this.player.setCollideWorldBounds(true);
+    this.player.setSize(20, 24);
+    this.player.setOffset(6, 6);
+    this.player.setDepth(5);
+
+    // ─── Camera ─────────────────────────────────────────────
+    this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
+    this.cameras.main.setBounds(0, 0, this.worldBounds.w, this.worldBounds.h);
+    this.cameras.main.setZoom(1.5);
+
+    // ─── Input ──────────────────────────────────────────────
+    this.cursors = this.input.keyboard!.createCursorKeys();
+    this.wasd = {
+      W: this.input.keyboard!.addKey('W'),
+      A: this.input.keyboard!.addKey('A'),
+      S: this.input.keyboard!.addKey('S'),
+      D: this.input.keyboard!.addKey('D'),
+    };
+
+    // Click to attack
+    this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      this.handleClick(pointer);
     });
 
-    // Also check immediately (auth may have already arrived)
+    // Number keys for abilities
+    this.input.keyboard!.on('keydown-ONE', () => this.useAbility(0));
+    this.input.keyboard!.on('keydown-TWO', () => this.useAbility(1));
+    this.input.keyboard!.on('keydown-THREE', () => this.useAbility(2));
+    this.input.keyboard!.on('keydown-FOUR', () => this.useAbility(3));
+    this.input.keyboard!.on('keydown-FIVE', () => this.useAbility(4));
+
+    // E key for interact
+    this.input.keyboard!.on('keydown-E', () => this.interact());
+
+    // ─── Spawn Monsters ─────────────────────────────────────
+    this.spawnMonsters();
+
+    // ─── Spawn NPCs ─────────────────────────────────────────
+    this.spawnNPCs();
+
+    // ─── Collisions ─────────────────────────────────────────
+    // Player vs solid tiles
+    const solidBodies = this.physics.add.staticGroup();
+    this.children.each((child) => {
+      if ((child as any).tileType !== undefined) {
+        solidBodies.add(child as Phaser.Physics.Arcade.Sprite);
+      }
+      return true;
+    });
+    this.physics.add.collider(this.player, solidBodies);
+
+    // ─── Start UI Scene ─────────────────────────────────────
+    this.scene.launch('UIScene');
+    this.uiScene = this.scene.get('UIScene');
+
+    // ─── Notify UI of initial state ─────────────────────────
     this.time.delayedCall(100, () => {
-      this.localPlayer = store.localPlayer;
-      if (this.localPlayer && !this.worldReady) {
-        this.setupWorld();
-      }
+      this.events.emit('playerUpdate', this.getPlayerState());
     });
   }
 
-  update(time: number, delta: number): void {
-    const dt = delta / 1000;
-    const now = time;
-
-    // ── Network state sync ──────────────────────────────────
-    this.network.update(dt);
-
-    // ── Check for late auth ─────────────────────────────────
-    const store = this.network.getStore();
-    if (!this.localPlayer && store.localPlayer) {
-      this.localPlayer = store.localPlayer;
-      if (!this.worldReady) this.setupWorld();
-    }
-
-    // ── Input ───────────────────────────────────────────────
-    this.inputManager.update();
-
-    // ── Entity sync & interpolation ─────────────────────────
-    this.entityManager.syncEntities();
-    this.entityManager.update(now);
-
-    // ── Movement prediction & sending ───────────────────────
-    if (this.localPlayer && now - this.lastMoveSendTime >= this.moveSendInterval) {
-      this.sendMovement();
-      this.lastMoveSendTime = now;
-    }
-
-    // ── Camera ──────────────────────────────────────────────
-    const localSprite = this.entityManager.getLocalPlayer();
-    if (localSprite) {
-      this.cameraManager.setFollowTarget(localSprite.sprite);
-    }
-    this.cameraManager.update(dt);
-
-    // ── Tilemap ─────────────────────────────────────────────
-    if (this.localPlayer) {
-      this.tilemapRenderer.loadChunksAround(this.localPlayer.x, this.localPlayer.y, 2);
-      this.tilemapRenderer.update(dt, this.localPlayer.x, this.localPlayer.y);
-    }
-
-    // ── Combat events ───────────────────────────────────────
-    const events = this.network.consumePendingEvents();
-    this.combatRenderer.handleDamage(events.damage);
-    this.combatRenderer.handleHeals(events.heals);
-    this.combatRenderer.handleAbilityEffects(events.abilities);
-    this.combatRenderer.handleBuffEvents(events.buffs);
-    this.combatRenderer.handleLootDrops(events.lootDrops);
-    this.combatRenderer.handleLevelUps(events.levelUps);
-    this.combatRenderer.handleDeaths(events.deaths);
-    this.combatRenderer.update(dt);
-
-    // ── Particles ───────────────────────────────────────────
-    this.particles.update(dt);
-
-    // Environmental particles
-    if (this.localPlayer) {
-      const cam = this.cameras.main;
-      this.particles.updateEnvironment(
-        dt,
-        cam.scrollX, cam.scrollY,
-        cam.width / cam.zoom, cam.height / cam.zoom,
-      );
-    }
-
-    // ── Chat messages ───────────────────────────────────────
-    while (this.lastChatCount < store.chatMessages.length) {
-      this.chatUI.addMessage(store.chatMessages[this.lastChatCount]);
-      this.lastChatCount++;
-    }
-
-    // ── Notifications ───────────────────────────────────────
-    for (const notif of store.notifications) {
-      if (notif.type === 'error') {
-        this.chatUI.addSystemMessage(`⚠ ${notif.message}`);
-      } else if (notif.type === 'quest_complete') {
-        this.chatUI.addSystemMessage(`✨ ${notif.message}`);
-      }
-    }
-    store.notifications.length = 0;
-
-    // ── HUD updates ─────────────────────────────────────────
-    if (this.localPlayer) {
-      this.hud.updatePlayer(this.localPlayer);
-
-      // Minimap
-      const entities: { x: number; y: number; hostile: boolean }[] = [];
-      for (const [, entity] of this.entityManager.getAllEntities()) {
-        const data = entity.data;
-        const hostile = 'hostile' in data ? !!(data as MonsterData | NPCData).hostile : false;
-        entities.push({ x: entity.sprite.x, y: entity.sprite.y, hostile });
-      }
-
-      this.hud.updateMinimap(
-        this.localPlayer.x, this.localPlayer.y,
-        256 * GAME_CONFIG.TILE_SIZE, 256 * GAME_CONFIG.TILE_SIZE,
-        entities,
-        this.cameras.main.scrollX, this.cameras.main.scrollY,
-        this.cameras.main.width / this.cameras.main.zoom,
-        this.cameras.main.height / this.cameras.main.zoom,
-      );
-
-      // Quest tracker
-      this.questTracker.updateQuests(store.questLog);
-
-      // Map UI
-      this.mapUI.setPlayerPosition(this.localPlayer.x, this.localPlayer.y);
-    }
-
-    // Target frame
-    const selected = this.entityManager.getSelectedEntity();
-    if (selected) {
-      const data = selected.data;
-      const hp = 'hp' in data ? (data as { hp: number }).hp : 0;
-      const maxHp = 'max_hp' in data ? (data as { max_hp: number }).max_hp : 0;
-      const level = 'level' in data ? (data as { level: number }).level : 1;
-      const hostile = 'hostile' in data ? !!(data as MonsterData | NPCData).hostile : false;
-      this.hud.updateTarget(data.name, level, hp, maxHp, hostile);
-    } else {
-      this.hud.hideTarget();
-    }
-
-    // Cooldowns
-    this.hud.updateCooldowns(this.combatRenderer.getCooldowns());
-
-    // Weather
-    if (store.weather && store.weather.weather !== this.currentWeather) {
-      this.currentWeather = store.weather.weather;
-      this.applyWeather(this.currentWeather);
-    }
-  }
-
-  // ─── World Setup ──────────────────────────────────────────
-
-  private setupWorld(): void {
-    if (!this.localPlayer || this.worldReady) return;
-    this.worldReady = true;
-
-    this.entityManager.createLocalPlayer(this.localPlayer);
-
-    const localSprite = this.entityManager.getLocalPlayer();
-    if (localSprite) {
-      this.cameraManager.setFollowTarget(localSprite.sprite);
-    }
-
-    this.tilemapRenderer.loadChunksAround(this.localPlayer.x, this.localPlayer.y, 2);
-    this.mapUI.setWorldSize(256, 256);
-
-    // Mark network loading complete
-    this.network.setLoading(false);
-  }
-
-  // ─── Input Handling ───────────────────────────────────────
-
-  private handleInput(action: InputAction): void {
-    switch (action.type) {
-      case 'move':
-        break; // Movement handled in update via inputManager.getMovementVector()
-
-      case 'move_to_point':
-        this.handleClickMove(action.worldX, action.worldY);
-        break;
-
-      case 'ability':
-        this.useAbility(action.slot);
-        break;
-
-      case 'target':
-        if (action.entityId === null) {
-          const nextId = this.entityManager.cycleTarget();
-          this.entityManager.selectEntity(nextId);
-        } else {
-          this.entityManager.selectEntity(action.entityId);
-        }
-        break;
-
-      case 'interact':
-        this.ws.send('player.interact', { target_id: action.targetId });
-        break;
-
-      case 'ui_toggle':
-        this.handleUIToggle(action.panel);
-        break;
-    }
-  }
-
-  private handleClickMove(worldX: number, worldY: number): void {
-    const entityId = this.entityManager.getEntityAtWorldPoint(worldX, worldY, 24);
-    if (entityId) {
-      this.entityManager.selectEntity(entityId);
-      const entity = this.entityManager.getEntity(entityId);
-      if (entity?.type === 'monster') {
-        this.ws.send('player.attack', { target_id: entityId, ability_id: 'melee' });
-      } else if (entity?.type === 'npc') {
-        this.ws.send('player.interact', { target_id: entityId });
+  update(_time: number, delta: number): void {
+    if (this.isDead) {
+      this.respawnTimer -= delta;
+      if (this.respawnTimer <= 0) {
+        this.respawn();
       }
       return;
     }
 
-    if (this.localPlayer) {
-      this.localPlayer.x = worldX;
-      this.localPlayer.y = worldY;
-      this.inputManager.clearClickMove();
+    this.handleMovement(delta);
+    this.updateMonsters(delta);
+    this.updateCombat(delta);
+    this.updateLootPickup();
+    this.updateUI();
+  }
+
+  // ─── Movement ──────────────────────────────────────────────
+  private handleMovement(_delta: number): void {
+    let vx = 0, vy = 0;
+    let direction = this.playerDirection;
+
+    if (this.wasd.A.isDown || this.cursors.left.isDown) {
+      vx = -SPEED;
+      direction = 'left';
+    } else if (this.wasd.D.isDown || this.cursors.right.isDown) {
+      vx = SPEED;
+      direction = 'right';
+    }
+
+    if (this.wasd.W.isDown || this.cursors.up.isDown) {
+      vy = -SPEED;
+      direction = 'up';
+    } else if (this.wasd.S.isDown || this.cursors.down.isDown) {
+      vy = SPEED;
+      direction = 'down';
+    }
+
+    // Normalize diagonal movement
+    if (vx !== 0 && vy !== 0) {
+      vx *= 0.707;
+      vy *= 0.707;
+    }
+
+    this.player.setVelocity(vx, vy);
+    this.playerDirection = direction;
+
+    // Update sprite based on direction and animation frame
+    const moving = vx !== 0 || vy !== 0;
+    const frame = moving ? Math.floor(Date.now() / 200) % 2 : 0;
+    this.player.setTexture(`player_${direction}_${frame}`);
+  }
+
+  // ─── Monster Spawning ──────────────────────────────────────
+  private spawnMonsters(): void {
+    const spawns = [
+      // Near village - easy
+      { x: 20, y: 20, type: 'slime', name: 'Green Slime', hp: 30, dmg: 5, xp: 15, lvl: 1, speed: 40, aggro: 120 },
+      { x: 22, y: 25, type: 'slime', name: 'Green Slime', hp: 30, dmg: 5, xp: 15, lvl: 1, speed: 40, aggro: 120 },
+      { x: 15, y: 30, type: 'wolf', name: 'Forest Wolf', hp: 50, dmg: 8, xp: 25, lvl: 2, speed: 80, aggro: 150 },
+      { x: 18, y: 35, type: 'wolf', name: 'Forest Wolf', hp: 50, dmg: 8, xp: 25, lvl: 2, speed: 80, aggro: 150 },
+      // Medium area
+      { x: 55, y: 15, type: 'goblin', name: 'Goblin Scout', hp: 80, dmg: 12, xp: 40, lvl: 3, speed: 60, aggro: 130 },
+      { x: 58, y: 18, type: 'goblin', name: 'Goblin Warrior', hp: 120, dmg: 15, xp: 55, lvl: 4, speed: 50, aggro: 140 },
+      { x: 62, y: 12, type: 'goblin', name: 'Goblin Shaman', hp: 70, dmg: 18, xp: 50, lvl: 4, speed: 45, aggro: 160 },
+      // Hard area
+      { x: 70, y: 40, type: 'skeleton', name: 'Skeletal Warrior', hp: 150, dmg: 20, xp: 75, lvl: 5, speed: 55, aggro: 140 },
+      { x: 72, y: 45, type: 'skeleton', name: 'Skeletal Mage', hp: 100, dmg: 25, xp: 80, lvl: 6, speed: 40, aggro: 180 },
+      { x: 68, y: 50, type: 'spider', name: 'Giant Spider', hp: 130, dmg: 18, xp: 65, lvl: 5, speed: 70, aggro: 130 },
+      // Boss
+      { x: 75, y: 55, type: 'dragon', name: 'Ancient Dragon', hp: 500, dmg: 40, xp: 300, lvl: 10, speed: 30, aggro: 250 },
+    ];
+
+    for (const s of spawns) {
+      const sprite = this.physics.add.sprite(s.x * TILE, s.y * TILE, s.type);
+      sprite.setSize(24, 24);
+      sprite.setOffset(4, 6);
+      sprite.setDepth(4);
+      sprite.setCollideWorldBounds(true);
+
+      const hpBar = this.add.graphics();
+      hpBar.setDepth(10);
+
+      const monster: MonsterData = {
+        sprite,
+        hp: s.hp,
+        maxHp: s.hp,
+        name: s.name,
+        level: s.lvl,
+        damage: s.dmg,
+        xp: s.xp,
+        speed: s.speed,
+        direction: Math.random() * Math.PI * 2,
+        moveTimer: 0,
+        hpBar,
+        dead: false,
+        aggroRange: s.aggro,
+        target: false,
+      };
+
+      this.monsters.push(monster);
+
+      // Monster-player collision
+      this.physics.add.collider(this.player, sprite, () => {
+        // Push back
+      });
     }
   }
 
-  private useAbility(slot: number): void {
-    if (!this.localPlayer) return;
+  // ─── NPC Spawning ──────────────────────────────────────────
+  private spawnNPCs(): void {
+    const npcSpawns = [
+      { x: 38, y: 30, type: 'quest' as const, name: 'Elder Theron', dialogue: [
+        'Welcome, adventurer! The village needs your help.',
+        'Dark creatures have been spotted in the forest.',
+        'Will you help us clear them out?',
+        'Accept Quest: Clear the Forest (Kill 5 Wolves)',
+      ]},
+      { x: 42, y: 28, type: 'merchant' as const, name: 'Merchant Boris', dialogue: [
+        'Welcome to my shop!',
+        'I have potions, weapons, and supplies.',
+        'What would you like to buy?',
+        '[Health Potion - 10g] [Mana Potion - 12g]',
+      ]},
+      { x: 35, y: 35, type: 'guard' as const, name: 'Captain Aldric', dialogue: [
+        'Halt! State your business.',
+        'The roads are dangerous. Be careful out there.',
+        'If you encounter bandits, report back to me.',
+      ]},
+      { x: 45, y: 32, type: 'quest' as const, name: 'Herbalist Mira', dialogue: [
+        'Oh, a traveler! I need herbs for my medicines.',
+        'Could you gather some Peacebloom for me?',
+        'You can find them in the meadows to the north.',
+        'Accept Quest: Herb Gathering (Collect 3 Herbs)',
+      ]},
+    ];
 
-    const cdEnds = this.abilityCooldowns.get(slot);
-    if (cdEnds && Date.now() < cdEnds) {
-      this.soundManager.playError();
-      return;
+    for (const n of npcSpawns) {
+      const textureKey = n.type === 'quest' ? 'npc_quest' : n.type === 'merchant' ? 'npc_merchant' : 'npc_guard';
+      const sprite = this.physics.add.sprite(n.x * TILE, n.y * TILE, textureKey);
+      sprite.setSize(24, 24);
+      sprite.setOffset(4, 6);
+      sprite.setDepth(4);
+      sprite.setImmovable(true);
+
+      this.npcs.push({
+        sprite,
+        name: n.name,
+        dialogue: n.dialogue,
+        type: n.type,
+      });
+
+      this.physics.add.collider(this.player, sprite);
+    }
+  }
+
+  // ─── Combat ────────────────────────────────────────────────
+  private handleClick(pointer: Phaser.Input.Pointer): void {
+    if (this.isDead || this.isAttacking) return;
+
+    const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+
+    // Check if clicking on a monster
+    for (const monster of this.monsters) {
+      if (monster.dead) continue;
+
+      const dist = Phaser.Math.Distance.Between(
+        this.player.x, this.player.y,
+        monster.sprite.x, monster.sprite.y,
+      );
+
+      if (dist < 60 && this.isPointerOnMonster(pointer, monster)) {
+        this.targetMonster = monster;
+        monster.target = true;
+        this.performAttack(monster);
+        return;
+      }
+    }
+  }
+
+  private isPointerOnMonster(pointer: Phaser.Input.Pointer, monster: MonsterData): boolean {
+    const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+    const bounds = monster.sprite.getBounds();
+    return bounds.contains(worldPoint.x, worldPoint.y);
+  }
+
+  private performAttack(monster: MonsterData): void {
+    if (this.attackCooldown > 0) return;
+
+    this.isAttacking = true;
+    this.attackCooldown = 500; // ms
+
+    // Face the monster
+    const dx = monster.sprite.x - this.player.x;
+    const dy = monster.sprite.y - this.player.y;
+    if (Math.abs(dx) > Math.abs(dy)) {
+      this.playerDirection = dx > 0 ? 'right' : 'left';
+    } else {
+      this.playerDirection = dy > 0 ? 'down' : 'up';
     }
 
-    const abilityId = `ability_${slot}`;
-    const selected = this.entityManager.getSelectedEntity();
+    // Calculate damage
+    const baseDmg = this.playerDamage;
+    const variance = Math.floor(Math.random() * 6) - 3;
+    const crit = Math.random() < 0.15;
+    let damage = baseDmg + variance;
+    if (crit) damage = Math.floor(damage * 1.8);
 
-    if (selected) {
-      this.ws.send('player.use_ability', { ability_id: abilityId, target_id: selected.id });
+    // Apply damage
+    monster.hp -= damage;
+    this.lastDamageTime = Date.now();
+
+    // Show damage number
+    this.showDamageNumber(monster.sprite.x, monster.sprite.y - 20, damage, crit);
+
+    // Slash effect
+    this.showSlashEffect(monster.sprite.x, monster.sprite.y);
+
+    // Hit sound placeholder
+    this.cameras.main.shake(50, 0.002);
+
+    // Check death
+    if (monster.hp <= 0) {
+      this.killMonster(monster);
+    }
+
+    // Reset attack state
+    this.time.delayedCall(300, () => {
+      this.isAttacking = false;
+    });
+  }
+
+  private useAbility(index: number): void {
+    if (this.isDead) return;
+
+    const abilities = [
+      { name: 'Slash', cost: 0, dmg: 20, mpCost: 0 },
+      { name: 'Power Strike', cost: 0, dmg: 35, mpCost: 10 },
+      { name: 'Whirlwind', cost: 0, dmg: 25, mpCost: 15 },
+      { name: 'Heal', cost: 0, dmg: -30, mpCost: 20 },
+      { name: 'Fireball', cost: 0, dmg: 50, mpCost: 25 },
+    ];
+
+    const ability = abilities[index];
+    if (!ability) return;
+
+    if (ability.mpCost > this.playerMp) return;
+
+    this.playerMp -= ability.mpCost;
+
+    if (ability.dmg < 0) {
+      // Heal
+      this.playerHp = Math.min(this.playerMaxHp, this.playerHp - ability.dmg);
+      this.showDamageNumber(this.player.x, this.player.y - 20, -ability.dmg, false, true);
+      this.showHealEffect(this.player.x, this.player.y);
+    } else if (this.targetMonster && !this.targetMonster.dead) {
+      // Attack target
+      const monster = this.targetMonster;
+      monster.hp -= ability.dmg;
+      this.showDamageNumber(monster.sprite.x, monster.sprite.y - 20, ability.dmg, false);
+      this.showSlashEffect(monster.sprite.x, monster.sprite.y);
+
+      if (monster.hp <= 0) {
+        this.killMonster(monster);
+      }
+    }
+  }
+
+  private interact(): void {
+    // Check for nearby NPCs
+    for (const npc of this.npcs) {
+      const dist = Phaser.Math.Distance.Between(
+        this.player.x, this.player.y,
+        npc.sprite.x, npc.sprite.y,
+      );
+
+      if (dist < 60) {
+        // Send dialogue to UI
+        this.events.emit('npcDialogue', {
+          name: npc.name,
+          dialogue: npc.dialogue,
+          type: npc.type,
+        });
+        return;
+      }
+    }
+
+    // Check for nearby loot
+    for (let i = this.loots.length - 1; i >= 0; i--) {
+      const loot = this.loots[i];
+      const dist = Phaser.Math.Distance.Between(
+        this.player.x, this.player.y,
+        loot.sprite.x, loot.sprite.y,
+      );
+
+      if (dist < 50) {
+        this.pickupLoot(loot, i);
+        return;
+      }
+    }
+  }
+
+  private killMonster(monster: MonsterData): void {
+    monster.dead = true;
+    monster.hp = 0;
+    monster.sprite.setVelocity(0, 0);
+    monster.sprite.setAlpha(0.3);
+    monster.hpBar.clear();
+
+    // Drop loot
+    this.dropLoot(monster);
+
+    // Grant XP
+    this.gainXP(monster.xp);
+
+    // Drop gold
+    const goldDrop = Math.floor(Math.random() * 10) + monster.level * 2;
+    this.gold += goldDrop;
+    this.events.emit('chatMessage', {
+      channel: 'loot',
+      message: `You looted ${goldDrop} gold from ${monster.name}`,
+    });
+
+    // Respawn after 30 seconds
+    this.time.delayedCall(30000, () => {
+      this.respawnMonster(monster);
+    });
+  }
+
+  private respawnMonster(monster: MonsterData): void {
+    monster.dead = false;
+    monster.hp = monster.maxHp;
+    monster.sprite.setAlpha(1);
+    monster.sprite.setPosition(monster.sprite.x, monster.sprite.y);
+  }
+
+  private dropLoot(monster: MonsterData): void {
+    const lootTable: { chance: number; id: string; name: string; icon: string }[] = [
+      { chance: 0.5, id: 'potion_hp', name: 'Health Potion', icon: '🧪' },
+      { chance: 0.2, id: 'wolf_pelt', name: 'Wolf Pelt', icon: '🐺' },
+      { chance: 0.15, id: 'bone', name: 'Bone Fragment', icon: '🦴' },
+      { chance: 0.08, id: 'sword_iron', name: 'Iron Sword', icon: '⚔️' },
+      { chance: 0.05, id: 'ring_power', name: 'Ring of Power', icon: '💍' },
+    ];
+
+    for (const loot of lootTable) {
+      if (Math.random() < loot.chance) {
+        const sprite = this.physics.add.sprite(
+          monster.sprite.x + Math.random() * 20 - 10,
+          monster.sprite.y + Math.random() * 20 - 10,
+          'fx_loot',
+        );
+        sprite.setDepth(3);
+        sprite.setAlpha(0.8);
+
+        // Float animation
+        this.tweens.add({
+          targets: sprite,
+          y: sprite.y - 5,
+          duration: 1000,
+          yoyo: true,
+          repeat: -1,
+          ease: 'Sine.easeInOut',
+        });
+
+        this.loots.push({
+          sprite,
+          itemId: loot.id,
+          name: loot.name,
+        });
+
+        this.events.emit('chatMessage', {
+          channel: 'loot',
+          message: `${monster.name} dropped: ${loot.name}`,
+        });
+      }
+    }
+  }
+
+  private pickupLoot(loot: LootData, index: number): void {
+    // Add to inventory
+    const existing = this.inventory.find(i => i.id === loot.itemId);
+    if (existing) {
+      existing.qty++;
     } else {
-      this.ws.send('player.use_ability', {
-        ability_id: abilityId,
-        x: this.localPlayer.x,
-        y: this.localPlayer.y,
+      const icons: Record<string, string> = {
+        potion_hp: '🧪', wolf_pelt: '🐺', bone: '🦴',
+        sword_iron: '⚔️', ring_power: '💍',
+      };
+      this.inventory.push({
+        id: loot.itemId,
+        name: loot.name,
+        qty: 1,
+        icon: icons[loot.itemId] || '📦',
       });
     }
 
-    const cooldownDuration = 1500;
-    this.abilityCooldowns.set(slot, Date.now() + cooldownDuration);
-    this.combatRenderer.setCooldown(abilityId, slot, cooldownDuration / 1000);
-    this.soundManager.playUIClick();
+    // Remove sprite
+    loot.sprite.destroy();
+    this.loots.splice(index, 1);
+
+    this.events.emit('chatMessage', {
+      channel: 'loot',
+      message: `Picked up: ${loot.name}`,
+    });
+
+    this.events.emit('inventoryUpdate', this.inventory);
   }
 
-  private handleUIToggle(panel: string): void {
-    switch (panel) {
-      case 'inventory':
-        this.inventoryUI.toggle();
-        this.inputManager.setUIOpen(this.inventoryUI.isVisible());
-        this.soundManager.playUIClick();
-        break;
-      case 'character':
-        break;
-      case 'map':
-        this.mapUI.toggle();
-        this.inputManager.setUIOpen(this.mapUI.isVisible());
-        this.soundManager.playUIClick();
-        break;
-      case 'skills':
-        break;
-      case 'menu':
-        break;
-    }
-  }
+  // ─── Monster AI ────────────────────────────────────────────
+  private updateMonsters(delta: number): void {
+    for (const monster of this.monsters) {
+      if (monster.dead) continue;
 
-  // ─── Movement ─────────────────────────────────────────────
+      const distToPlayer = Phaser.Math.Distance.Between(
+        monster.sprite.x, monster.sprite.y,
+        this.player.x, this.player.y,
+      );
 
-  private sendMovement(): void {
-    if (!this.localPlayer) return;
+      monster.moveTimer -= delta;
 
-    const moveVec = this.inputManager.getMovementVector();
-    if (moveVec.dx === 0 && moveVec.dy === 0 && !this.inputManager.isClickMoving()) {
-      return;
-    }
+      // Aggro behavior
+      if (distToPlayer < monster.aggroRange) {
+        // Chase player
+        const angle = Phaser.Math.Angle.Between(
+          monster.sprite.x, monster.sprite.y,
+          this.player.x, this.player.y,
+        );
+        monster.sprite.setVelocity(
+          Math.cos(angle) * monster.speed,
+          Math.sin(angle) * monster.speed,
+        );
 
-    let targetX = this.localPlayer.x;
-    let targetY = this.localPlayer.y;
-    let speed = 0;
-
-    if (moveVec.dx !== 0 || moveVec.dy !== 0) {
-      targetX += moveVec.dx * this.playerSpeed * 0.05;
-      targetY += moveVec.dy * this.playerSpeed * 0.05;
-      speed = this.playerSpeed;
-    } else if (this.inputManager.isClickMoving()) {
-      const target = this.inputManager.getMoveTarget();
-      if (target) {
-        targetX = target.worldX;
-        targetY = target.worldY;
-        speed = this.playerSpeed;
+        // Attack if close enough
+        if (distToPlayer < 36 && monster.moveTimer <= 0) {
+          this.monsterAttackPlayer(monster);
+          monster.moveTimer = 1500; // attack cooldown
+        }
+      } else {
+        // Wander
+        if (monster.moveTimer <= 0) {
+          monster.direction = Math.random() * Math.PI * 2;
+          monster.moveTimer = 2000 + Math.random() * 3000;
+          const wanderSpeed = monster.speed * 0.3;
+          monster.sprite.setVelocity(
+            Math.cos(monster.direction) * wanderSpeed,
+            Math.sin(monster.direction) * wanderSpeed,
+          );
+        }
       }
+
+      // Update HP bar
+      this.updateMonsterHpBar(monster);
     }
+  }
 
-    this.localPlayer.x = targetX;
-    this.localPlayer.y = targetY;
+  private monsterAttackPlayer(monster: MonsterData): void {
+    if (this.isDead) return;
 
-    const direction = InputManager.vectorToDirection(
-      targetX - this.localPlayer.x,
-      targetY - this.localPlayer.y,
-    );
+    const damage = monster.damage + Math.floor(Math.random() * 4) - 2;
+    this.playerHp -= damage;
+    this.lastDamageTime = Date.now();
 
-    this.ws.send('player.move', {
-      x: targetX,
-      y: targetY,
-      direction,
-      speed,
-      input_seq: ++this.moveSequence,
+    this.showDamageNumber(this.player.x, this.player.y - 20, damage, false);
+    this.cameras.main.shake(80, 0.003);
+
+    if (this.playerHp <= 0) {
+      this.playerDeath();
+    }
+  }
+
+  private updateMonsterHpBar(monster: MonsterData): void {
+    monster.hpBar.clear();
+    if (monster.hp >= monster.maxHp) return;
+
+    const x = monster.sprite.x - 16;
+    const y = monster.sprite.y - 24;
+    const w = 32;
+    const h = 4;
+
+    // Background
+    monster.hpBar.fillStyle(0x000000, 0.7);
+    monster.hpBar.fillRect(x - 1, y - 1, w + 2, h + 2);
+
+    // HP fill
+    const pct = monster.hp / monster.maxHp;
+    const color = pct > 0.5 ? 0x00ff00 : pct > 0.25 ? 0xffaa00 : 0xff0000;
+    monster.hpBar.fillStyle(color);
+    monster.hpBar.fillRect(x, y, w * pct, h);
+  }
+
+  // ─── Player State ──────────────────────────────────────────
+  private playerDeath(): void {
+    this.isDead = true;
+    this.player.setVelocity(0, 0);
+    this.player.setAlpha(0.3);
+    this.respawnTimer = 5000;
+
+    this.events.emit('chatMessage', {
+      channel: 'system',
+      message: 'You have died! Respawning in 5 seconds...',
     });
   }
 
-  // ─── Weather ──────────────────────────────────────────────
+  private respawn(): void {
+    this.isDead = false;
+    this.playerHp = this.playerMaxHp;
+    this.playerMp = this.playerMaxMp;
+    this.player.setAlpha(1);
+    this.player.setPosition(40 * TILE, 32 * TILE);
+    this.targetMonster = null;
 
-  private applyWeather(weather: WeatherType): void {
-    switch (weather) {
-      case WeatherType.RAIN:
-        this.particles.setEnvironment('rain');
-        break;
-      case WeatherType.STORM:
-        this.particles.setEnvironment('rain');
-        break;
-      case WeatherType.SNOW:
-        this.particles.setEnvironment('snow');
-        break;
-      case WeatherType.FOG:
-        this.particles.setEnvironment('dust');
-        break;
-      default:
-        this.particles.setEnvironment('none');
-        break;
+    this.events.emit('chatMessage', {
+      channel: 'system',
+      message: 'You have respawned.',
+    });
+  }
+
+  private gainXP(xp: number): void {
+    this.playerXp += xp;
+
+    this.events.emit('chatMessage', {
+      channel: 'xp',
+      message: `Gained ${xp} experience!`,
+    });
+
+    while (this.playerXp >= this.playerXpToLevel) {
+      this.playerXp -= this.playerXpToLevel;
+      this.playerLevel++;
+      this.playerXpToLevel = Math.floor(this.playerXpToLevel * 1.5);
+      this.playerMaxHp += 15;
+      this.playerMaxMp += 8;
+      this.playerDamage += 3;
+      this.playerHp = this.playerMaxHp;
+      this.playerMp = this.playerMaxMp;
+
+      this.events.emit('chatMessage', {
+        channel: 'system',
+        message: `🎉 LEVEL UP! You are now level ${this.playerLevel}!`,
+      });
+
+      this.showLevelUpEffect();
     }
   }
 
-  // ─── Cleanup ──────────────────────────────────────────────
+  // ─── Effects ───────────────────────────────────────────────
+  private showDamageNumber(x: number, y: number, damage: number, crit: boolean, heal: boolean = false): void {
+    const color = heal ? '#00ff00' : crit ? '#ffd700' : '#ff4444';
+    const size = crit ? '20px' : '16px';
+    const text = heal ? `+${damage}` : crit ? `${damage}!` : `-${damage}`;
 
-  shutdown(): void {
-    this.soundManager?.stopMusic();
-    this.inputManager?.destroy();
-    this.cameraManager?.destroy();
-    this.entityManager?.destroy();
-    this.combatRenderer?.destroy();
-    this.tilemapRenderer?.destroy();
-    this.particles?.destroy();
-    this.hud?.destroy();
-    this.inventoryUI?.destroy();
-    this.chatUI?.destroy();
-    this.questTracker?.destroy();
-    this.mapUI?.destroy();
+    const dmgText = this.add.text(x, y, text, {
+      fontFamily: 'Arial',
+      fontSize: size,
+      color,
+      fontStyle: 'bold',
+      stroke: '#000000',
+      strokeThickness: 3,
+    });
+    dmgText.setOrigin(0.5);
+    dmgText.setDepth(20);
+
+    this.tweens.add({
+      targets: dmgText,
+      y: y - 40,
+      alpha: 0,
+      duration: 1000,
+      ease: 'Power2',
+      onComplete: () => dmgText.destroy(),
+    });
+  }
+
+  private showSlashEffect(x: number, y: number): void {
+    const slash = this.add.image(x, y, 'fx_slash');
+    slash.setDepth(15);
+    slash.setAlpha(0.8);
+
+    this.tweens.add({
+      targets: slash,
+      alpha: 0,
+      scaleX: 1.5,
+      scaleY: 1.5,
+      rotation: 1,
+      duration: 300,
+      onComplete: () => slash.destroy(),
+    });
+  }
+
+  private showHealEffect(x: number, y: number): void {
+    for (let i = 0; i < 5; i++) {
+      const particle = this.add.image(
+        x + Math.random() * 30 - 15,
+        y + 20,
+        'fx_heal',
+      );
+      particle.setDepth(15);
+      particle.setAlpha(0.8);
+
+      this.tweens.add({
+        targets: particle,
+        y: y - 30,
+        alpha: 0,
+        duration: 800,
+        delay: i * 100,
+        onComplete: () => particle.destroy(),
+      });
+    }
+  }
+
+  private showLevelUpEffect(): void {
+    const text = this.add.text(this.player.x, this.player.y - 40, 'LEVEL UP!', {
+      fontFamily: 'Arial',
+      fontSize: '24px',
+      color: '#ffd700',
+      fontStyle: 'bold',
+      stroke: '#000000',
+      strokeThickness: 4,
+    });
+    text.setOrigin(0.5);
+    text.setDepth(25);
+
+    this.tweens.add({
+      targets: text,
+      y: this.player.y - 100,
+      alpha: 0,
+      scaleX: 1.5,
+      scaleY: 1.5,
+      duration: 2000,
+      onComplete: () => text.destroy(),
+    });
+
+    this.cameras.main.flash(500, 255, 215, 0);
+  }
+
+  // ─── Combat Update ─────────────────────────────────────────
+  private updateCombat(delta: number): void {
+    if (this.attackCooldown > 0) {
+      this.attackCooldown -= delta;
+    }
+
+    // Combat regen (5 seconds after last damage)
+    if (Date.now() - this.lastDamageTime > 5000) {
+      this.combatRegenTimer += delta;
+      if (this.combatRegenTimer >= 3000) {
+        this.combatRegenTimer = 0;
+        this.playerHp = Math.min(this.playerMaxHp, this.playerHp + 2);
+        this.playerMp = Math.min(this.playerMaxMp, this.playerMp + 1);
+      }
+    }
+
+    // Deselect dead target
+    if (this.targetMonster && this.targetMonster.dead) {
+      this.targetMonster = null;
+    }
+  }
+
+  // ─── Loot Pickup ───────────────────────────────────────────
+  private updateLootPickup(): void {
+    for (let i = this.loots.length - 1; i >= 0; i--) {
+      const loot = this.loots[i];
+      const dist = Phaser.Math.Distance.Between(
+        this.player.x, this.player.y,
+        loot.sprite.x, loot.sprite.y,
+      );
+
+      if (dist < 30) {
+        this.pickupLoot(loot, i);
+      }
+    }
+  }
+
+  // ─── UI Update ─────────────────────────────────────────────
+  private updateUI(): void {
+    this.events.emit('playerUpdate', this.getPlayerState());
+
+    if (this.targetMonster && !this.targetMonster.dead) {
+      this.events.emit('targetUpdate', {
+        name: this.targetMonster.name,
+        level: this.targetMonster.level,
+        hp: this.targetMonster.hp,
+        maxHp: this.targetMonster.maxHp,
+      });
+    } else {
+      this.events.emit('targetClear');
+    }
+  }
+
+  private getPlayerState() {
+    return {
+      name: this.playerName,
+      level: this.playerLevel,
+      hp: this.playerHp,
+      maxHp: this.playerMaxHp,
+      mp: this.playerMp,
+      maxMp: this.playerMaxMp,
+      xp: this.playerXp,
+      xpToLevel: this.playerXpToLevel,
+      gold: this.gold,
+      direction: this.playerDirection,
+      x: Math.floor(this.player.x / TILE),
+      y: Math.floor(this.player.y / TILE),
+    };
   }
 }

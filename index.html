@@ -1,120 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-  <meta name="description" content="Nexus Realms — A web-based MMORPG" />
-  <meta name="theme-color" content="#0a0a1a" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nexus Realms</title>
-  <link rel="stylesheet" href="/assets/ui/styles.css" />
   <style>
-    /* Critical inline styles for initial paint */
-    #nr-loading-screen {
-      position: fixed;
-      inset: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      z-index: 9999;
-      background: #050510;
-    }
-    #nr-loading-screen.fade-out {
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 600ms ease;
-    }
-    #game-container {
-      position: absolute;
-      inset: 0;
-      z-index: 1;
-    }
-    /* Prevent FOUC */
-    #nr-loading-screen h1 {
-      font-family: 'Cinzel', 'Georgia', 'Times New Roman', serif;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #game-container { width: 100%; height: 100%; }
+    canvas { display: block; }
   </style>
-  <!-- Preload Cinzel font for the title -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&display=swap" rel="stylesheet" />
 </head>
 <body>
-  <!-- ─── Loading Screen ──────────────────────────────────── -->
-  <div id="nr-loading-screen" class="nr-loading" role="status" aria-live="polite" aria-label="Loading game">
-    <div class="nr-login__bg" style="opacity:0.5;"></div>
-    <h1 class="nr-loading__title">⚔️ NEXUS REALMS</h1>
-    <div class="nr-loading__bar-container">
-      <div class="nr-loading__bar" id="nr-loading-bar"></div>
-    </div>
-    <p class="nr-loading__text" id="nr-loading-text">Initializing...</p>
-    <p class="nr-loading__tips" id="nr-loading-tip">Use WASD or arrow keys to move your character.</p>
-  </div>
-
-  <!-- ─── Game Canvas Container ───────────────────────────── -->
-  <div id="game-container" aria-label="Game viewport"></div>
-
-  <!-- ─── UI Overlay Root (populated by UIManager) ────────── -->
-  <!--
-    UIManager creates all DOM elements at runtime:
-    - #nr-ui-root        → main overlay container
-    - #nr-hud             → HUD layer (bars, ability bar, buffs, minimap)
-    - #nr-panels          → panel layer (inventory, map, character, guild, spellbook, settings)
-    - #nr-overlay         → backdrop overlay for modals
-    - .nr-notifications   → notification toasts
-    - .nr-login           → login screen (created by LoginUI)
-    - .nr-tooltip         → floating tooltip (created by UIManager)
-  -->
-
-  <!-- ─── Game Entry Point ────────────────────────────────── -->
+  <div id="game-container"></div>
   <script type="module" src="/src/client/main.ts"></script>
-
-  <!-- ─── Loading Screen Logic ────────────────────────────── -->
-  <script>
-    // Rotate loading tips
-    (function() {
-      const tips = [
-        'Use WASD or arrow keys to move your character.',
-        'Press 1-0 to use abilities on your action bar.',
-        'Right-click items in your inventory to equip or use them.',
-        'Press M to open the world map.',
-        'Press C to open your character sheet.',
-        'Press Enter to open chat, then type your message.',
-        'Press Tab while typing to cycle chat channels.',
-        'Complete quests to earn experience and gold!',
-        'Join a guild to find allies and tackle dungeons together.',
-        'Explore the world to discover hidden treasures and rare loot.',
-      ];
-      let idx = 0;
-      const tipEl = document.getElementById('nr-loading-tip');
-      if (tipEl) {
-        setInterval(() => {
-          idx = (idx + 1) % tips.length;
-          tipEl.style.opacity = '0';
-          setTimeout(() => {
-            tipEl.textContent = tips[idx];
-            tipEl.style.opacity = '0.7';
-          }, 300);
-        }, 5000);
-      }
-    })();
-
-    // Expose loading progress API for the game client
-    window.NexusLoading = {
-      setProgress: function(pct, text) {
-        var bar = document.getElementById('nr-loading-bar');
-        var txt = document.getElementById('nr-loading-text');
-        if (bar) bar.style.width = Math.min(100, pct) + '%';
-        if (txt && text) txt.textContent = text;
-      },
-      hide: function() {
-        var screen = document.getElementById('nr-loading-screen');
-        if (screen) {
-          screen.classList.add('fade-out');
-          setTimeout(function() { screen.style.display = 'none'; }, 600);
-        }
-      }
-    };
-  </script>
 </body>
 </html>
